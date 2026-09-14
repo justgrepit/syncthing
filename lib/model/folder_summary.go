@@ -399,6 +399,14 @@ func (c *folderSummaryService) sendSummary(ctx context.Context, folder string) {
 			continue
 		}
 
+		// kyos: skip devices we are not connected to. Completion runs a
+		// full-folder query per device on every index update, and nothing
+		// reads a disconnected device's figure until it reconnects — at which
+		// point DeviceConnected re-queues every folder it shares.
+		if !c.model.ConnectedTo(devCfg.DeviceID) {
+			continue
+		}
+
 		// Get completion percentage of this folder for the
 		// remote device.
 		comp, err := c.model.Completion(devCfg.DeviceID, folder)
