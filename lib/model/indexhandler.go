@@ -16,6 +16,7 @@ import (
 
 	"github.com/syncthing/syncthing/internal/db"
 	"github.com/syncthing/syncthing/internal/itererr"
+	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -544,6 +545,12 @@ func (r *indexHandlerRegistry) startLocked(folder config.FolderConfiguration, ru
 
 	is, err := newIndexHandler(r.conn, r.downloads, folder, r.sdb, runner, startInfo, r.evLogger)
 	if err != nil {
+		// kyos: this used to be discarded by every caller, leaving the folder
+		// running with no handler — the peer's index was then refused as "no
+		// such folder" and our own index never sent (kyos incident
+		// 2026-09-15). Callers keep the start info pending and retry; see
+		// startPendingLocked.
+		slog.Warn("Failed to start index handler", r.conn.DeviceID().LogAttr(), folder.LogAttr(), slogutil.Error(err))
 		return err
 	}
 	r.indexHandlers.Add(folder.ID, is)
@@ -571,7 +578,19 @@ func (r *indexHandlerRegistry) AddIndexInfo(folder string, startInfo *clusterCon
 		r.startInfos[folder] = startInfo
 		return
 	}
-	_ = r.startLocked(folderState.cfg, folderState.runner, startInfo) // XXX error handling...
+	_ = r.startPendingLocked(folderState, startInfo) // logged in startLocked, retried later
+}
+
+// startPendingLocked starts the index handler and, when that fails, keeps the
+// start info pending (kyos). The start is retried when the folder is registered
+// again and when the peer sends an index for it (ReceiveIndex), which then
+// returns the real error instead of ErrFolderMissing.
+func (r *indexHandlerRegistry) startPendingLocked(state *indexHandlerFolderState, startInfo *clusterConfigDeviceInfo) error {
+	if err := r.startLocked(state.cfg, state.runner, startInfo); err != nil {
+		r.startInfos[state.cfg.ID] = startInfo
+		return err
+	}
+	return nil
 }
 
 // Remove stops a running index handler or removes one pending to be started.
@@ -682,9 +701,9 @@ func (r *indexHandlerRegistry) folderRunningLocked(folder config.FolderConfigura
 			r.indexHandlers.RemoveAndWait(folder.ID, 0)
 			l.Debugf("Removed index handler for device %v and folder %v in resume", r.conn.DeviceID().Short(), folder.ID)
 		}
-		_ = r.startLocked(folder, runner, info) // XXX error handling...
-		delete(r.startInfos, folder.ID)
-		l.Debugf("Started index handler for device %v and folder %v in resume", r.conn.DeviceID().Short(), folder.ID)
+		if r.startPendingLocked(r.folderStates[folder.ID], info) == nil {
+			l.Debugf("Started index handler for device %v and folder %v in resume", r.conn.DeviceID().Short(), folder.ID)
+		}
 	} else if isOk {
 		l.Debugf("Resuming index handler for device %v and folder %v", r.conn.DeviceID().Short(), folder)
 		is.resume(runner)
@@ -711,6 +730,19 @@ func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInf
 				return fmt.Errorf("%s: starting index handler for resumed remote folder: %w", folder, err)
 			}
 			delete(r.remotePausedInfos, folder)
+			is, isOk = r.indexHandlers.Get(folder)
+		}
+	}
+	if !isOk {
+		// A start that failed (kyos, see startPendingLocked) is retried here.
+		// If it fails again the error closes the connection naming the cause;
+		// the index is not lost, the peer resends it on the next connection.
+		info, pending := r.startInfos[folder]
+		state, running := r.folderStates[folder]
+		if pending && running {
+			if err := r.startPendingLocked(state, info); err != nil {
+				return fmt.Errorf("%s: starting index handler: %w", folder, err)
+			}
 			is, isOk = r.indexHandlers.Get(folder)
 		}
 	}
