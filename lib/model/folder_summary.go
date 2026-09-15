@@ -32,6 +32,15 @@ type FolderSummaryService interface {
 
 // The folderSummaryService adds summary information events (FolderSummary and
 // FolderCompletion) into the event stream at certain intervals.
+// FolderCompletionInterval bounds how often the summary loop recomputes
+// per-device completion for one folder (kyos). Completion is a full-folder SQL
+// query per device; upstream reran it for every device on every index update,
+// which kept a kyos server node's Syncthing at ~40-60% of a core. The folder's
+// own summary still refreshes on every update; only the per-device
+// FolderCompletion events (read by Syncthing's web UI, not by kyos) wait.
+// A variable so tests can shorten it.
+var FolderCompletionInterval = 5 * time.Minute
+
 type folderSummaryService struct {
 	*suture.Supervisor
 
@@ -44,6 +53,10 @@ type folderSummaryService struct {
 	// For keeping track of folders to recalculate for
 	foldersMut sync.Mutex
 	folders    map[string]struct{}
+
+	// kyos: when per-device completion last ran, per folder.
+	completionMut  sync.Mutex
+	lastCompletion map[string]time.Time
 }
 
 func NewFolderSummaryService(cfg config.Wrapper, m Model, id protocol.DeviceID, evLogger events.Logger) FolderSummaryService {
@@ -55,6 +68,8 @@ func NewFolderSummaryService(cfg config.Wrapper, m Model, id protocol.DeviceID, 
 		evLogger:   evLogger,
 		immediate:  make(chan string),
 		folders:    make(map[string]struct{}),
+
+		lastCompletion: make(map[string]time.Time),
 	}
 
 	service.Add(svcutil.AsService(service.listenForUpdates, fmt.Sprintf("%s/listenForUpdates", service)))
@@ -387,6 +402,12 @@ func (c *folderSummaryService) sendSummary(ctx context.Context, folder string) {
 	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeDeleted).Set(float64(data.NeedDeletes))
 	metricFolderSummary.WithLabelValues(folder, metricScopeNeed, metricTypeBytes).Set(float64(data.NeedBytes))
 
+	// kyos: per-device completion at most once per FolderCompletionInterval
+	// per folder — see the variable's comment.
+	if !c.completionDue(folder) {
+		return
+	}
+
 	for _, devCfg := range c.cfg.Folders()[folder].Devices {
 		select {
 		case <-ctx.Done():
@@ -419,4 +440,17 @@ func (c *folderSummaryService) sendSummary(ctx context.Context, folder string) {
 		ev["device"] = devCfg.DeviceID.String()
 		c.evLogger.Log(events.FolderCompletion, ev)
 	}
+}
+
+// completionDue reports whether per-device completion should run for folder
+// now, and records the run when it should (kyos).
+func (c *folderSummaryService) completionDue(folder string) bool {
+	c.completionMut.Lock()
+	defer c.completionMut.Unlock()
+	now := time.Now()
+	if last, ok := c.lastCompletion[folder]; ok && now.Sub(last) < FolderCompletionInterval {
+		return false
+	}
+	c.lastCompletion[folder] = now
+	return true
 }

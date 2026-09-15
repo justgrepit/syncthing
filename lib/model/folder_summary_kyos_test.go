@@ -78,3 +78,67 @@ func TestSummarySkipsCompletionForDisconnectedDevices(t *testing.T) {
 		}
 	}
 }
+
+// kyos patch: per-device completion for a folder runs at most once per
+// FolderCompletionInterval. On a server node most peers stay connected, so
+// skipping offline devices alone left the loop at ~70% of Syncthing's CPU.
+func TestSummaryThrottlesCompletionPerFolder(t *testing.T) {
+	self := protocol.NewDeviceID([]byte("self"))
+	online := protocol.NewDeviceID([]byte("online"))
+
+	cfg := config.New(self)
+	cfg.Devices = append(cfg.Devices, config.DeviceConfiguration{DeviceID: online})
+	cfg.Folders = []config.FolderConfiguration{{
+		ID:             "f",
+		Path:           t.TempDir(),
+		FilesystemType: config.FilesystemTypeBasic,
+		Devices:        []config.FolderDeviceConfiguration{{DeviceID: self}, {DeviceID: online}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wrapper := config.Wrap("", cfg, self, events.NoopLogger)
+	go wrapper.Serve(ctx)
+
+	saved := model.FolderCompletionInterval
+	defer func() { model.FolderCompletionInterval = saved }()
+	model.FolderCompletionInterval = time.Hour
+
+	fake := &mocks.Model{}
+	fake.ConnectedToReturns(true)
+	evLogger := events.NewLogger()
+	go evLogger.Serve(ctx)
+	fss := model.NewFolderSummaryService(wrapper, fake, self, evLogger)
+	go fss.Serve(ctx)
+
+	idle := func() {
+		evLogger.Log(events.StateChanged, map[string]interface{}{"folder": "f", "from": "syncing", "to": "idle"})
+	}
+	waitFor := func(want int) {
+		deadline := time.Now().Add(5 * time.Second)
+		for fake.CompletionCallCount() < want && time.Now().Before(deadline) {
+			idle()
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	waitFor(1)
+	if got := fake.CompletionCallCount(); got != 1 {
+		t.Fatalf("first summary: %d Completion calls, want 1", got)
+	}
+	// More updates inside the interval must not recompute completion.
+	for i := 0; i < 10; i++ {
+		idle()
+		time.Sleep(50 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := fake.CompletionCallCount(); got != 1 {
+		t.Fatalf("within FolderCompletionInterval: %d Completion calls, want still 1", got)
+	}
+
+	// Once the interval has passed, the next update recomputes.
+	model.FolderCompletionInterval = 0
+	waitFor(2)
+	if got := fake.CompletionCallCount(); got < 2 {
+		t.Fatalf("after the interval: %d Completion calls, want at least 2", got)
+	}
+}
