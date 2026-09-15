@@ -1441,7 +1441,9 @@ func (m *model) ccHandleFolders(folders []protocol.Folder, deviceCfg config.Devi
 		}
 
 		if !folder.IsRunning() {
-			indexHandlers.Remove(folder.ID)
+			// Keep the start info: the remote may send an index for this
+			// folder before its resume ClusterConfig arrives (kyos).
+			indexHandlers.RemoveRemotePaused(folder.ID, ccDeviceInfos[folder.ID])
 			seenFolders[cfg.ID] = remoteFolderPaused
 			continue
 		}

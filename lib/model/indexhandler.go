@@ -500,7 +500,11 @@ type indexHandlerRegistry struct {
 	indexHandlers *serviceMap[string, *indexHandler]
 	startInfos    map[string]*clusterConfigDeviceInfo
 	folderStates  map[string]*indexHandlerFolderState
-	mut           sync.Mutex
+	// remotePausedInfos holds the start info from the last ClusterConfig that
+	// reported a folder as not running on the remote (kyos). See
+	// RemoveRemotePaused and ReceiveIndex.
+	remotePausedInfos map[string]*clusterConfigDeviceInfo
+	mut               sync.Mutex
 }
 
 type indexHandlerFolderState struct {
@@ -517,7 +521,9 @@ func newIndexHandlerRegistry(conn protocol.Connection, sdb db.DB, downloads *dev
 		indexHandlers: newServiceMap[string, *indexHandler](evLogger),
 		startInfos:    make(map[string]*clusterConfigDeviceInfo),
 		folderStates:  make(map[string]*indexHandlerFolderState),
-		mut:           sync.Mutex{},
+
+		remotePausedInfos: make(map[string]*clusterConfigDeviceInfo),
+		mut:               sync.Mutex{},
 	}
 	return r
 }
@@ -558,6 +564,7 @@ func (r *indexHandlerRegistry) AddIndexInfo(folder string, startInfo *clusterCon
 	if r.indexHandlers.RemoveAndWait(folder, 0) == nil {
 		l.Debugf("Removed index sender for device %v and folder %v due to added pending", r.conn.DeviceID().Short(), folder)
 	}
+	delete(r.remotePausedInfos, folder)
 	folderState, ok := r.folderStates[folder]
 	if !ok {
 		l.Debugf("Pending index handler for device %v and folder %v", r.conn.DeviceID().Short(), folder)
@@ -576,7 +583,30 @@ func (r *indexHandlerRegistry) Remove(folder string) {
 	l.Debugf("Removing index handler for device %v and folder %v", r.conn.DeviceID().Short(), folder)
 	r.indexHandlers.RemoveAndWait(folder, 0)
 	delete(r.startInfos, folder)
+	delete(r.remotePausedInfos, folder)
 	l.Debugf("Removed index handler for device %v and folder %v", r.conn.DeviceID().Short(), folder)
+}
+
+// RemoveRemotePaused stops the index handler for a folder the remote reports
+// as not running, like Remove, but remembers the ClusterConfig's start info
+// (kyos). The remote announces the resume in a new ClusterConfig, which is
+// sent asynchronously and possibly on another connection, while its index
+// handler starts sending right away. Without the remembered info an index that
+// wins that race hits ReceiveIndex with no handler, gets ErrFolderMissing, and
+// the connection closes ("handling index for X: X: no such folder") — on a
+// client that pauses and resumes folders on every start this repeated on every
+// reconnect (kyos incident 2026-09-15). The info is deliberately NOT a pending
+// startInfo: resuming the folder locally must still not start sending to a
+// remote that has it paused.
+func (r *indexHandlerRegistry) RemoveRemotePaused(folder string, startInfo *clusterConfigDeviceInfo) {
+	r.mut.Lock()
+	defer r.mut.Unlock()
+
+	r.indexHandlers.RemoveAndWait(folder, 0)
+	delete(r.startInfos, folder)
+	if startInfo != nil {
+		r.remotePausedInfos[folder] = startInfo
+	}
 }
 
 // RemoveAllExcept stops all running index handlers and removes those pending to be started,
@@ -597,6 +627,11 @@ func (r *indexHandlerRegistry) RemoveAllExcept(except map[string]remoteFolderSta
 		if _, ok := except[folder]; !ok {
 			delete(r.startInfos, folder)
 			l.Debugf("Removed pending index handler for device %v and folder %v (removeAllExcept)", r.conn.DeviceID().Short(), folder)
+		}
+	}
+	for folder := range r.remotePausedInfos {
+		if _, ok := except[folder]; !ok {
+			delete(r.remotePausedInfos, folder)
 		}
 	}
 }
@@ -662,6 +697,23 @@ func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInf
 	r.mut.Lock()
 	defer r.mut.Unlock()
 	is, isOk := r.indexHandlers.Get(folder)
+	if !isOk {
+		// The remote said this folder was not running and is now sending an
+		// index for it, so it resumed and its new ClusterConfig has not been
+		// handled yet (kyos, see RemoveRemotePaused). If the folder runs here,
+		// start the handler from the remembered start info and take the index
+		// instead of closing the connection; the next ClusterConfig restarts the
+		// handler with fresh info as usual.
+		info, remembered := r.remotePausedInfos[folder]
+		state, running := r.folderStates[folder]
+		if remembered && running {
+			if err := r.startLocked(state.cfg, state.runner, info); err != nil {
+				return fmt.Errorf("%s: starting index handler for resumed remote folder: %w", folder, err)
+			}
+			delete(r.remotePausedInfos, folder)
+			is, isOk = r.indexHandlers.Get(folder)
+		}
+	}
 	if !isOk {
 		slog.Warn("Unexpected operation on nonexistent or paused folder", "op", op, "folder", folder)
 		return fmt.Errorf("%s: %w", folder, ErrFolderMissing)
