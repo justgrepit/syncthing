@@ -715,10 +715,30 @@ func (r *indexHandlerRegistry) ReceiveIndex(folder string, fs []protocol.FileInf
 		}
 	}
 	if !isOk {
+		if _, running := r.folderStates[folder]; !running {
+			// The folder is configured here but not running for this
+			// connection yet: a local resume is still being committed
+			// (restartFolder registers it), or it was just paused. The peer
+			// sent this because an earlier ClusterConfig said the folder runs
+			// (kyos incident 2026-09-15: a client walking its folders through
+			// pause/resume rejected every such index and closed the
+			// connection). Drop it instead of closing: once the folder runs,
+			// CommitConfiguration sends a ClusterConfig and the peer resends
+			// from the sequence we recorded, so nothing is lost.
+			l.Debugf("Dropping %s for %s from %v: folder not running here yet", op, folder, r.conn.DeviceID().Short())
+			return nil
+		}
 		slog.Warn("Unexpected operation on nonexistent or paused folder", "op", op, "folder", folder)
 		return fmt.Errorf("%s: %w", folder, ErrFolderMissing)
 	}
-	return is.receive(fs, update, op, prevSequence, lastSequence)
+	err := is.receive(fs, update, op, prevSequence, lastSequence)
+	if errors.Is(err, ErrFolderPaused) {
+		// Same race with the handler still paused (receive checks that
+		// before touching anything). Resuming re-sends ClusterConfig (kyos).
+		l.Debugf("Dropping %s for %s from %v: index handler paused", op, folder, r.conn.DeviceID().Short())
+		return nil
+	}
+	return err
 }
 
 // makeForgetUpdate takes an index update and constructs a download progress update

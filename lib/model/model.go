@@ -1173,8 +1173,12 @@ func (m *model) handleIndex(conn protocol.Connection, folder string, fs []protoc
 		slog.Warn(`Operation for unexpected folder ID; ensure that the folder exists and that this device is selected under "Share With" in the folder configuration.`, slog.String("operation", op), cfg.LogAttr(), deviceID.LogAttr())
 		return fmt.Errorf("%s: %w", folder, ErrFolderMissing)
 	} else if cfg.Paused {
-		l.Debugf("%v for paused folder (ID %q) sent from device %q.", op, folder, deviceID)
-		return fmt.Errorf("%s: %w", folder, ErrFolderPaused)
+		// Dropped, not an error (kyos): the peer has not handled our paused
+		// ClusterConfig yet, and returning an error closes the connection. Our
+		// resume sends a new ClusterConfig and the peer resends from the
+		// sequence we recorded.
+		l.Debugf("%v for paused folder (ID %q) sent from device %q, dropped.", op, folder, deviceID)
+		return nil
 	}
 
 	m.mut.RLock()
